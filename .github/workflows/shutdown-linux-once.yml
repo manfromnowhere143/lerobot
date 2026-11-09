@@ -1,0 +1,94 @@
+name: Shutdown Linux qualification
+
+on:
+  push:
+    branches: [ci/shutdown-linux-ed874a0]
+
+permissions: {}
+
+jobs:
+  shutdown:
+    if: github.repository == 'manfromnowhere143/lerobot' && github.event.created
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      UV_NO_CACHE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      DEVICE: cpu
+      LEROBOT_TEST_DEVICE: cpu
+      CUDA_VISIBLE_DEVICES: ''
+      OMP_NUM_THREADS: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      HF_HUB_OFFLINE: '1'
+      HF_DATASETS_OFFLINE: '1'
+    steps:
+      - name: Check out the exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ed874a0d6cded43b03988eb73034cd99092d28d8
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up locked tooling
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        with:
+          version: '0.11.30'
+          python-version: '3.12.13'
+          enable-cache: false
+      - name: Install the native test and transport extras
+        run: uv sync --locked --extra test --extra remote --extra dataset
+      - name: Qualify the candidate and verify regression coverage
+        run: |
+          test "$(git rev-parse HEAD)" = ed874a0d6cded43b03988eb73034cd99092d28d8
+          uv run --no-sync python -c 'import sys, platform, importlib.metadata as m; print(sys.version); print(platform.platform()); print({n:m.version(n) for n in ["lerobot", "torch", "pytest", "eclipse-zenoh", "msgpack"]})'
+          timeout 300s uv run --no-sync pytest tests/env_server tests/scripts/test_lerobot_env_server.py tests/sim tests/transport -q -ra --tb=short --junitxml=/tmp/shutdown-candidate.xml
+          uv run --no-sync python - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/shutdown-candidate.xml').getroot()
+          cases = [c for c in root.iter('testcase') if c.get('name', '').startswith('test_the_server_runs_in_its_own_process_and_stops_on_signal[')]
+          assert len(cases) == 4, [c.attrib for c in cases]
+          assert all(c.find('failure') is None and c.find('error') is None and c.find('skipped') is None for c in cases)
+          print(json.dumps({'candidate_suites': [s.attrib for s in root.iter('testsuite')], 'signal_cases': [c.attrib for c in cases]}, indent=2))
+          PY
+          git diff --exit-code
+      - name: Verify the unchanged-production adverse controls
+        run: |
+          git restore --source=81b8c5bfdd5591ec59e512cfc7ac6db8151c70ee --worktree -- src/lerobot/env_server/server.py src/lerobot/scripts/lerobot_env_server.py
+          git diff --name-only
+          set +e
+          timeout 180s uv run --no-sync pytest tests/scripts/test_lerobot_env_server.py::test_the_server_runs_in_its_own_process_and_stops_on_signal -q -ra --tb=short --junitxml=/tmp/shutdown-baseline.xml
+          result=$?
+          set -e
+          test "$result" = 1
+          uv run --no-sync python - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/shutdown-baseline.xml').getroot()
+          cases = list(root.iter('testcase'))
+          assert len(cases) == 4, [c.attrib for c in cases]
+          failed = []
+          passed = []
+          for case in cases:
+              assert case.find('error') is None and case.find('skipped') is None, case.attrib
+              failure = case.find('failure')
+              if 'wait-lock-held' in case.get('name', ''):
+                  assert failure is not None, case.attrib
+                  text = ''.join(failure.itertext())
+                  assert all(marker in text for marker in ['lerobot-env-server did not stop', 'in set', 'in wait']), text
+                  failed.append(case.attrib)
+              else:
+                  assert 'ordinary' in case.get('name', '') and failure is None, case.attrib
+                  passed.append(case.attrib)
+          assert len(failed) == len(passed) == 2
+          print(json.dumps({'baseline_suites': [s.attrib for s in root.iter('testsuite')], 'ordinary_passed': passed, 'expected_deadlocks': failed}, indent=2))
+          PY
+      - name: Retain test receipts in the job log
+        if: always()
+        run: |
+          for receipt in /tmp/shutdown-candidate.xml /tmp/shutdown-baseline.xml; do
+            if test -f "$receipt"; then
+              cat "$receipt"
+            fi
+          done
